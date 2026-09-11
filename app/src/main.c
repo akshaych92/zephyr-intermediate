@@ -3,56 +3,78 @@
 
 LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
 
-#define STACK_SIZE      1024
-#define PRIO            5
-#define INCREMENTS      1000000   /* each thread increments this many times */
+#define STACK_SIZE       1024
+#define PRIO             5
+#define SENSOR_PERIOD_MS 100
+#define RUN_SECONDS      3
 
-/* Shared state - intentionally unprotected */
-static volatile uint32_t counter;
+/* Bonus debounce demo: 5 events fired within this window collapse to 1 run */
+#define BURST_EVENTS      5
+#define BURST_GAP_MS      4   /* 5 events * 4 ms = 20 ms burst window       */
+#define DEBOUNCE_MS       20
 
-static struct k_sem done_sem;
+/* Shared event flag between the "ISR-like" producer and the work handler */
+static volatile bool data_ready;
+static struct k_sem sensor_sem;
+static uint32_t handler_runs;
 
-static K_MUTEX_DEFINE(counter_mtx);
-
-void worker_fn(void *p1, void *p2, void *p3)
+/* --- k_work handler: only runs when (re)scheduled by a real event ------- */
+static void event_work_handler(struct k_work *work)
 {
-    const char *name = k_thread_name_get(k_current_get());
+    handler_runs++;
 
-    for (int i = 0; i < INCREMENTS; i++) {
-
-        k_mutex_lock(&counter_mtx, K_FOREVER);
-        counter++;
-        k_mutex_unlock(&counter_mtx);
+    if (data_ready) {
+        data_ready = false;
+        LOG_INF("event_work: handled event (handler run #%u)", handler_runs);
+    } else {
+        LOG_INF("event_work: debounced burst settled (handler run #%u)",
+                handler_runs);
     }
-
-    LOG_INF("[%s] finished", name);
-    k_sem_give(&done_sem);
 }
 
-K_THREAD_DEFINE(worker_a, STACK_SIZE, worker_fn, NULL, NULL, NULL,
+static struct k_work_delayable event_work;
+
+/* --- Producer: fires a "real event" every 100 ms ------------------------ */
+static void sensor_sim_fn(void *p1, void *p2, void *p3)
+{
+    for (;;) {
+        k_sleep(K_MSEC(SENSOR_PERIOD_MS));
+        data_ready = true;
+        k_sem_give(&sensor_sem);
+        LOG_INF("sensor_sim: event raised");
+        /* Submit immediately: no polling, the handler wakes on the event */
+        k_work_reschedule(&event_work, K_NO_WAIT);
+    }
+}
+
+/* --- Bonus: burst of 5 events inside 20 ms, debounced via reschedule --- */
+static void burst_test_fn(void *p1, void *p2, void *p3)
+{
+    k_sleep(K_SECONDS(1));
+
+    LOG_INF("burst_test: firing %d events %d ms apart (debounce=%d ms)",
+            BURST_EVENTS, BURST_GAP_MS, DEBOUNCE_MS);
+
+    for (int i = 0; i < BURST_EVENTS; i++) {
+        LOG_INF("burst_test: raw event %d/%d", i + 1, BURST_EVENTS);
+        /* Each new event pushes the deadline out, coalescing the burst */
+        k_work_reschedule(&event_work, K_MSEC(DEBOUNCE_MS));
+        k_sleep(K_MSEC(BURST_GAP_MS));
+    }
+}
+
+K_THREAD_DEFINE(sensor_sim, STACK_SIZE, sensor_sim_fn, NULL, NULL, NULL,
                 PRIO, 0, 0);
-K_THREAD_DEFINE(worker_b, STACK_SIZE, worker_fn, NULL, NULL, NULL,
+K_THREAD_DEFINE(burst_test, STACK_SIZE, burst_test_fn, NULL, NULL, NULL,
                 PRIO, 0, 0);
 
 int main(void)
 {
-    k_sem_init(&done_sem, 0, 2);
+    k_sem_init(&sensor_sem, 0, 1);
+    k_work_init_delayable(&event_work, event_work_handler);
 
-    LOG_INF("=== L2 Demo 1: Shared Counter Corruption ===");
-    LOG_INF("Expected final value: %d", INCREMENTS * 2);
-
-    /* Wait for both workers to complete */
-    k_sem_take(&done_sem, K_FOREVER);
-    k_sem_take(&done_sem, K_FOREVER);
-
-    LOG_INF("Actual  final value: %u", counter);
-
-    if (counter == INCREMENTS * 2) {
-        LOG_WRN("No race this run - timing-dependent, try again");
-    } else {
-        LOG_ERR("Race condition confirmed: lost %d updates",
-                (INCREMENTS * 2) - counter);
-    }
+    LOG_INF("=== k_work version: sensor_sim (100 ms) drives event_work directly ===");
+    LOG_INF("No polling thread: the handler only fires when work is (re)scheduled");
 
     return 0;
 }
