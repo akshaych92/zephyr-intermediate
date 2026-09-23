@@ -1,155 +1,142 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/zbus/zbus.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
 LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
 
-#define STACK_SIZE       4096
-#define SENSOR_COUNT       18
-#define SENSOR_PERIOD_MS  100
+#define STACK_SIZE            4096
+#define QUEUE_CAPACITY          10
+#define PRODUCER_PERIOD_MS      50
+#define STUCK_AFTER_ITEMS        5
+#define STUCK_SLEEP_MS        3000
+#define WDT_FEED_PERIOD_MS     500
+#define HEALTH_CHECK_PERIOD_MS 200
+#define QUEUE_WARN_PCT          75
 
 /* ================================================================== */
-/*  Shared channel message                                            */
+/*  Producer/consumer pipeline                                        */
 /* ================================================================== */
 
-struct sensor_data {
-    int32_t temperature_mc;
+struct work_item {
+    uint32_t seq;
     uint32_t timestamp_ms;
-    uint8_t seq;
 };
 
-/* Forward declarations required before observer/channel definitions. */
-static void display_listener_cb(const struct zbus_channel *chan);
+K_MSGQ_DEFINE(work_q, sizeof(struct work_item), QUEUE_CAPACITY, 4);
+
+static int consumer_wdt_channel = -1;
 
 /* ================================================================== */
-/*  Observers                                                         */
+/*  Task watchdog callback                                            */
 /* ================================================================== */
 
-ZBUS_LISTENER_DEFINE(display_lis, display_listener_cb);
-
-/*
- * Logger is a message subscriber.
- * It receives message copies, not only channel notifications.
- */
-ZBUS_MSG_SUBSCRIBER_DEFINE(logger_sub);
-
-
-/* ================================================================== */
-/*  Channel                                                           */
-/* ================================================================== */
-
-ZBUS_CHAN_DEFINE(sensor_chan, struct sensor_data,
-                 NULL, NULL,
-                 ZBUS_OBSERVERS(display_lis, logger_sub),
-                 ZBUS_MSG_INIT(.temperature_mc = 0,
-                               .timestamp_ms = 0,
-                               .seq = 0));
-
-/* ================================================================== */
-/*  Listener - synchronous observer                                   */
-/* ================================================================== */
-
-static void display_listener_cb(const struct zbus_channel *chan)
+static void wdt_callback(int channel_id, void *user_data)
 {
-    const struct sensor_data *msg =
-        (const struct sensor_data *)zbus_chan_const_msg(chan);
+    ARG_UNUSED(user_data);
 
-    /*
-     * Listener runs in publisher context.
-     * Keep it short. No blocking work here.
-     */
-    LOG_INF("[DISPLAY-LIS] thread=%s seq=%u temp=%d mC",
-            k_thread_name_get(k_current_get()),
-            msg->seq,
-            msg->temperature_mc);
+    /* Fires when the consumer fails to feed its channel in time. */
+    LOG_ERR("[WATCHDOG] channel %d starved - consumer appears stuck!", channel_id);
 }
 
 /* ================================================================== */
-/*  Publisher                                                         */
+/*  Producer                                                          */
 /* ================================================================== */
 
-static void sensor_thread_fn(void *p1, void *p2, void *p3)
+static void producer_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    k_thread_name_set(k_current_get(), "sensor");
+    k_thread_name_set(k_current_get(), "producer");
 
-    for (int i = 0; i < SENSOR_COUNT; i++) {
-        struct sensor_data data = {
-            .temperature_mc = 24000 + (i * 350),
+    uint32_t seq = 0;
+
+    while (1) {
+        struct work_item item = {
+            .seq = seq++,
             .timestamp_ms = k_uptime_get_32(),
-            .seq = (uint8_t)i,
         };
 
-        LOG_INF("[SENSOR] publish seq=%u temp=%d mC",
-                data.seq,
-                data.temperature_mc);
-
-        int ret = zbus_chan_pub(&sensor_chan, &data, K_MSEC(100));
+        int ret = k_msgq_put(&work_q, &item, K_NO_WAIT);
         if (ret != 0) {
-            LOG_WRN("[SENSOR] publish failed ret=%d", ret);
+            LOG_WRN("[PRODUCER] queue full, dropped item seq=%u", item.seq);
+        } else {
+            LOG_INF("[PRODUCER] produced seq=%u", item.seq);
         }
 
-        k_msleep(SENSOR_PERIOD_MS);
+        k_msleep(PRODUCER_PERIOD_MS);
     }
-
-    LOG_INF("[SENSOR] done");
 }
 
 /* ================================================================== */
-/*  Message subscriber - logger                                       */
+/*  Consumer                                                           */
 /* ================================================================== */
 
-static void logger_thread_fn(void *p1, void *p2, void *p3)
+static void consumer_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    k_thread_name_set(k_current_get(), "logger");
+    k_thread_name_set(k_current_get(), "consumer");
 
-    const struct zbus_channel *chan;
-    int received = 0;
+    uint32_t processed = 0;
 
-    while (received < SENSOR_COUNT) {
-        struct sensor_data msg = {0};
+    while (1) {
+        struct work_item item;
 
-        /*
-         * Message subscribers receive a copy of the published message.
-         * The slow logger will not reread the latest channel value.
-         */
-        int ret = zbus_sub_wait_msg(&logger_sub, &chan, &msg, K_MSEC(1500));
-        if (ret != 0) {
-            LOG_WRN("[LOGGER-MSG] timeout ret=%d", ret);
-            break;
+        int ret = k_msgq_get(&work_q, &item, K_MSEC(WDT_FEED_PERIOD_MS));
+        if (ret == 0) {
+            LOG_INF("[CONSUMER] processed seq=%u latency=%ums",
+                    item.seq, k_uptime_get_32() - item.timestamp_ms);
+            processed++;
         }
 
-        received++;
+        /* Simulate a stuck consumer once, long enough to starve the watchdog. */
+        if (processed == STUCK_AFTER_ITEMS) {
+            LOG_WRN("[CONSUMER] simulating stall for %dms", STUCK_SLEEP_MS);
+            k_msleep(STUCK_SLEEP_MS);
+            processed++;
+        }
 
-        LOG_INF("[LOGGER-MSG] thread=%s seq=%u temp=%d latency=%ums",
-                k_thread_name_get(k_current_get()),
-                msg.seq,
-                msg.temperature_mc,
-                k_uptime_get_32() - msg.timestamp_ms);
-
-        /*
-         * Slow logger.
-         * Message copies let it process old samples safely.
-         */
-        k_msleep(350);
+        task_wdt_feed(consumer_wdt_channel);
     }
+}
 
-    LOG_INF("[LOGGER-MSG] done received=%d", received);
+/* ================================================================== */
+/*  Health-check thread                                                */
+/* ================================================================== */
+
+static void health_check_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    k_thread_name_set(k_current_get(), "health_check");
+
+    while (1) {
+        uint32_t used = k_msgq_num_used_get(&work_q);
+        uint32_t pct = (used * 100) / QUEUE_CAPACITY;
+
+        if (pct >= QUEUE_WARN_PCT) {
+            LOG_WRN("[HEALTH] queue fill %u%% (%u/%u) - approaching capacity",
+                    pct, used, QUEUE_CAPACITY);
+        } else {
+            LOG_DBG("[HEALTH] queue fill %u%% (%u/%u)", pct, used, QUEUE_CAPACITY);
+        }
+
+        k_msleep(HEALTH_CHECK_PERIOD_MS);
+    }
 }
 
 /* ================================================================== */
 /*  Threads                                                           */
 /* ================================================================== */
 
-K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_thread_fn,
+K_THREAD_DEFINE(producer_thread, STACK_SIZE, producer_thread_fn,
                 NULL, NULL, NULL, 5, 0, 0);
 
-K_THREAD_DEFINE(logger_thread, STACK_SIZE, logger_thread_fn,
-                NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(consumer_thread, STACK_SIZE, consumer_thread_fn,
+                NULL, NULL, NULL, 5, 0, 0);
 
+K_THREAD_DEFINE(health_check_thread, STACK_SIZE, health_check_thread_fn,
+                NULL, NULL, NULL, 6, 0, 0);
 
 /* ================================================================== */
 /*  Main                                                              */
@@ -157,10 +144,15 @@ K_THREAD_DEFINE(logger_thread, STACK_SIZE, logger_thread_fn,
 
 int main(void)
 {
-    LOG_INF("=== L4 Demo 2: Zbus Pub-Sub ===");
-    LOG_INF("sensor publishes every %dms", SENSOR_PERIOD_MS);
-    LOG_INF("display listener runs in publisher context");
-    LOG_INF("logger uses message subscriber copies");
+    LOG_INF("=== Producer/Consumer + Task Watchdog + Health Check ===");
+
+    task_wdt_init(NULL);
+
+    /* Consumer must feed this channel at least once per WDT_FEED_PERIOD_MS * 2. */
+    consumer_wdt_channel = task_wdt_add(WDT_FEED_PERIOD_MS * 2, wdt_callback, NULL);
+    if (consumer_wdt_channel < 0) {
+        LOG_ERR("failed to register watchdog channel: %d", consumer_wdt_channel);
+    }
 
     return 0;
 }
