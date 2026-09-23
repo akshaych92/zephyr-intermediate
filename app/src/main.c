@@ -24,6 +24,7 @@ struct work_item {
 
 K_MSGQ_DEFINE(work_q, sizeof(struct work_item), QUEUE_CAPACITY, 4);
 
+static int producer_wdt_channel = -1;
 static int consumer_wdt_channel = -1;
 
 /* ================================================================== */
@@ -32,10 +33,10 @@ static int consumer_wdt_channel = -1;
 
 static void wdt_callback(int channel_id, void *user_data)
 {
-    ARG_UNUSED(user_data);
+    const char *who = (const char *)user_data;
 
-    /* Fires when the consumer fails to feed its channel in time. */
-    LOG_ERR("[WATCHDOG] channel %d starved - consumer appears stuck!", channel_id);
+    /* Fires when the owning thread fails to feed its channel in time. */
+    LOG_ERR("[WATCHDOG] channel %d (%s) starved - thread appears stuck!", channel_id, who);
 }
 
 /* ================================================================== */
@@ -62,6 +63,8 @@ static void producer_thread_fn(void *p1, void *p2, void *p3)
         } else {
             LOG_INF("[PRODUCER] produced seq=%u", item.seq);
         }
+
+        task_wdt_feed(producer_wdt_channel);
 
         k_msleep(PRODUCER_PERIOD_MS);
     }
@@ -148,10 +151,15 @@ int main(void)
 
     task_wdt_init(NULL);
 
-    /* Consumer must feed this channel at least once per WDT_FEED_PERIOD_MS * 2. */
-    consumer_wdt_channel = task_wdt_add(WDT_FEED_PERIOD_MS * 2, wdt_callback, NULL);
+    /* Each thread gets its own channel so a stall is attributed to the right one. */
+    producer_wdt_channel = task_wdt_add(PRODUCER_PERIOD_MS * 10, wdt_callback, "producer");
+    if (producer_wdt_channel < 0) {
+        LOG_ERR("failed to register producer watchdog channel: %d", producer_wdt_channel);
+    }
+
+    consumer_wdt_channel = task_wdt_add(WDT_FEED_PERIOD_MS * 2, wdt_callback, "consumer");
     if (consumer_wdt_channel < 0) {
-        LOG_ERR("failed to register watchdog channel: %d", consumer_wdt_channel);
+        LOG_ERR("failed to register consumer watchdog channel: %d", consumer_wdt_channel);
     }
 
     return 0;
